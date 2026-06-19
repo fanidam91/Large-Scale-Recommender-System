@@ -54,8 +54,13 @@ import os
 dbfs_dir = "/tmp/recommender_data"
 dbutils.fs.mkdirs(dbfs_dir)
 
-local_zip = "/tmp/ml-latest-small.zip"
-extract_path = "/tmp/ml-extract"
+import uuid
+unique_id = str(uuid.uuid4())[:8]
+local_dir = f"/tmp/helixrec_temp_{unique_id}"
+os.makedirs(local_dir, exist_ok=True)
+
+local_zip = os.path.join(local_dir, "ml-latest-small.zip")
+extract_path = os.path.join(local_dir, "ml-extract")
 
 # Download the dataset
 dataset_url = "https://files.grouplens.org/datasets/movielens/ml-latest-small.zip"
