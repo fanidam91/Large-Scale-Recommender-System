@@ -1,0 +1,326 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # Large-Scale Recommender System Pipeline (Unity Catalog Volume Version)
+# MAGIC This notebook runs on Databricks (Spark) and builds a hybrid recommender system using Unity Catalog Volumes for storage.
+# MAGIC 
+# MAGIC Volume Path: `/Volumes/adb_core_data_dev_aue/default/recommender_volume`
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 1: Import Libraries and Initialize Session
+
+# COMMAND ----------
+
+import os
+import urllib.request
+import zipfile
+import numpy as np
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from pyspark.sql.types import IntegerType, DoubleType
+
+# Spark ML modules
+from pyspark.ml.recommendation import ALS
+from pyspark.ml.evaluation import RegressionEvaluator
+from pyspark.ml.tuning import ParamGridBuilder, CrossValidator
+from pyspark.ml.feature import Tokenizer, HashingTF, IDF, Normalizer
+from pyspark.mllib.evaluation import RankingMetrics, RegressionMetrics
+
+# Initialize Spark Session
+spark = SparkSession.builder \
+    .appName("LargeScaleRecommenderSystemVolume") \
+    .config("spark.sql.execution.arrow.pyspark.enabled", "true") \
+    .getOrCreate()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 2: Download and Ingest MovieLens Dataset to Volume
+
+# COMMAND ----------
+
+# Define the Unity Catalog Volume path
+volume_path = "/Volumes/adb_core_data_dev_aue/default/recommender_volume/data"
+os.makedirs(volume_path, exist_ok=True)
+
+# Using volume path for extraction
+extract_path = os.path.join(volume_path, "ml-extract")
+os.makedirs(extract_path, exist_ok=True)
+
+local_zip = os.path.join(volume_path, "ml-latest-small.zip")
+
+# Download the dataset
+dataset_url = "https://files.grouplens.org/datasets/movielens/ml-latest-small.zip"
+print(f"Downloading dataset to Volume...")
+urllib.request.urlretrieve(dataset_url, local_zip)
+
+# Extract file locally inside the Volume
+print("Extracting dataset...")
+with zipfile.ZipFile(local_zip, 'r') as zip_ref:
+    zip_ref.extractall(extract_path)
+
+print("Ingestion complete. CSV files are loaded inside the Volume.")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 3: Load DataFrames from Volume
+
+# COMMAND ----------
+
+# Load DataFrames directly from Volume paths
+volume_data_dir = "/Volumes/adb_core_data_dev_aue/default/recommender_volume/data/ml-extract/ml-latest-small"
+
+ratings_df = spark.read.csv(f"{volume_data_dir}/ratings.csv", header=True, inferSchema=True)
+movies_df = spark.read.csv(f"{volume_data_dir}/movies.csv", header=True, inferSchema=True)
+tags_df = spark.read.csv(f"{volume_data_dir}/tags.csv", header=True, inferSchema=True)
+
+print("Ratings Data:")
+ratings_df.show(5)
+print("Movies Data:")
+movies_df.show(5)
+print("Tags Data:")
+tags_df.show(5)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 4: Collaborative Filtering - ALS Model
+
+# COMMAND ----------
+
+# Train/Test Split (80/20)
+(training_df, test_df) = ratings_df.randomSplit([0.8, 0.2], seed=42)
+training_df.cache()
+test_df.cache()
+
+# Define ALS Model
+als = ALS(
+    userCol="userId",
+    itemCol="movieId",
+    ratingCol="rating",
+    nonnegative=True,
+    coldStartStrategy="drop"
+)
+
+# Hyperparameter Grid
+paramGrid = ParamGridBuilder() \
+    .addGrid(als.rank, [8, 12, 16]) \
+    .addGrid(als.regParam, [0.05, 0.1, 0.15]) \
+    .build()
+
+evaluator = RegressionEvaluator(
+    metricName="rmse",
+    labelCol="rating",
+    predictionCol="prediction"
+)
+
+# Cross Validation
+cv = CrossValidator(
+    estimator=als,
+    estimatorParamMaps=paramGrid,
+    evaluator=evaluator,
+    numFolds=3,
+    seed=42
+)
+
+print("Training ALS model with 3-fold cross validation...")
+cv_model = cv.fit(training_df)
+best_model = cv_model.bestModel
+
+print(f"Best Model Rank: {best_model.rank}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 5: Evaluate ALS Recommendations
+
+# COMMAND ----------
+
+predictions = best_model.transform(test_df)
+rmse = evaluator.evaluate(predictions)
+print(f"Test Root Mean Squared Error (RMSE): {rmse:.4f}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 6: Content-Based Filtering - TF-IDF
+
+# COMMAND ----------
+
+# Group tags by movieId and merge into a space-separated string
+tags_grouped = tags_df.groupBy("movieId") \
+    .agg(F.concat_ws(" ", F.collect_list("tag")).alias("tags"))
+
+# Join movies with tags and replace pipe symbol in genres with space
+movies_enriched = movies_df.join(tags_grouped, on="movieId", how="left") \
+    .withColumn("genres_clean", F.regexp_replace(F.col("genres"), r"\|", " ")) \
+    .withColumn("text_features", F.concat_ws(" ", F.col("genres_clean"), F.coalesce(F.col("tags"), F.lit("")))) \
+    .select("movieId", "title", "text_features")
+
+movies_enriched.cache()
+
+# Spark NLP Pipeline: Tokenizer -> HashingTF -> IDF
+tokenizer = Tokenizer(inputCol="text_features", outputCol="words")
+words_df = tokenizer.transform(movies_enriched)
+
+hashing_tf = HashingTF(inputCol="words", outputCol="raw_features", numFeatures=2000)
+featurized_df = hashing_tf.transform(words_df)
+
+idf = IDF(inputCol="raw_features", outputCol="features")
+idf_model = idf.fit(featurized_df)
+tfidf_df = idf_model.transform(featurized_df).select("movieId", "title", "features")
+
+tfidf_df.cache()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 7: Movie-to-Movie Cosine Similarities
+
+# COMMAND ----------
+
+# Normalize vectors to unit L2 norm
+normalizer = Normalizer(inputCol="features", outputCol="norm_features", p=2.0)
+norm_tfidf_df = normalizer.transform(tfidf_df).select("movieId", "norm_features")
+
+# Convert to vector dot product computation
+@F.udf(returnType=DoubleType())
+def cosine_similarity(v1, v2):
+    if v1 is None or v2 is None:
+        return 0.0
+    return float(v1.dot(v2))
+
+# Rename columns to perform self-join
+df_left = norm_tfidf_df.select(F.col("movieId").alias("movie_a"), F.col("norm_features").alias("vec_a"))
+df_right = norm_tfidf_df.select(F.col("movieId").alias("movie_b"), F.col("norm_features").alias("vec_b"))
+
+# Filter to avoid redundancy and compute similarity
+similarities_all = df_left.join(df_right, df_left.movie_a < df_right.movie_b) \
+    .withColumn("similarity", cosine_similarity("vec_a", "vec_b")) \
+    .filter("similarity > 0.1") \
+    .select("movie_a", "movie_b", "similarity")
+
+# Keep only the top 20 similar movies per movie
+window_spec = Window.partitionBy("movie_a").orderBy(F.desc("similarity"))
+top_similarities = similarities_all \
+    .withColumn("rank", F.row_number().over(window_spec)) \
+    .filter("rank <= 20") \
+    .select(
+        F.col("movie_a").alias("movieId"),
+        F.col("movie_b").alias("similarMovieId"),
+        "similarity"
+    )
+
+# Union the symmetric relation
+symmetric_similarities = similarities_all \
+    .select(F.col("movie_b").alias("movieId"), F.col("movie_a").alias("similarMovieId"), "similarity") \
+    .withColumn("rank", F.row_number().over(Window.partitionBy("movieId").orderBy(F.desc("similarity")))) \
+    .filter("rank <= 20")
+
+# Final combined similarity matrix
+movie_similarity_matrix = top_similarities.union(symmetric_similarities).distinct()
+movie_similarity_matrix.cache()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 8: Hybrid Recommendation Logic
+
+# COMMAND ----------
+
+# 1. Generate top 50 ALS recommendations for all users
+als_recs = best_model.recommendForAllUsers(50) \
+    .withColumn("rec", F.explode("recommendations")) \
+    .select("userId", F.col("rec.movieId").alias("movieId"), F.col("rec.rating").alias("als_score"))
+
+# 2. Extract highly rated movies for each user from training set
+user_likes = training_df.filter("rating >= 3.5") \
+    .select("userId", F.col("movieId").alias("liked_movieId"), "rating")
+
+# 3. Find candidate movies similar to the user's liked movies
+content_candidates = user_likes.join(movie_similarity_matrix, user_likes.liked_movieId == movie_similarity_matrix.movieId) \
+    .groupBy("userId", "similarMovieId") \
+    .agg(F.max("similarity").alias("content_score")) \
+    .select("userId", F.col("similarMovieId").alias("movieId"), "content_score")
+
+# 4. Join collaborative and content candidates
+hybrid_recs_all = als_recs.join(content_candidates, on=["userId", "movieId"], how="outer") \
+    .na.fill(0.0)
+
+# 5. Compute Hybrid Score (weighting ALS 0.6 and Content-based 0.4)
+w_als = 0.6
+w_content = 0.4
+hybrid_recs = hybrid_recs_all \
+    .withColumn("hybrid_score", F.lit(w_als) * F.col("als_score") + F.lit(w_content) * F.col("content_score"))
+
+# Get top 20 recommendations per user
+user_window = Window.partitionBy("userId").orderBy(F.desc("hybrid_score"))
+final_recommendations = hybrid_recs \
+    .withColumn("rank", F.row_number().over(user_window)) \
+    .filter("rank <= 20") \
+    .select("userId", "movieId", "als_score", "content_score", "hybrid_score")
+
+final_recommendations.cache()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 9: Distributed Evaluation (NDCG, MAP)
+
+# COMMAND ----------
+
+# 1. actual highly-rated movies per user in the test set
+test_actual = test_df.filter("rating >= 3.5") \
+    .groupBy("userId") \
+    .agg(F.collect_list("movieId").alias("actual_movies"))
+
+# 2. predicted movies for ALS
+als_recs_list = als_recs \
+    .withColumn("rank", F.row_number().over(Window.partitionBy("userId").orderBy(F.desc("als_score")))) \
+    .filter("rank <= 20") \
+    .groupBy("userId") \
+    .agg(F.collect_list("movieId").alias("predicted_als"))
+
+# 3. predicted movies for Hybrid
+hybrid_recs_list = final_recommendations \
+    .groupBy("userId") \
+    .agg(F.collect_list("movieId").alias("predicted_hybrid"))
+
+# Join and prepare RDD for RankingMetrics
+eval_rdd_als = als_recs_list.join(test_actual, "userId") \
+    .select("predicted_als", "actual_movies") \
+    .rdd.map(lambda row: (row[0], row[1]))
+
+eval_rdd_hybrid = hybrid_recs_list.join(test_actual, "userId") \
+    .select("predicted_hybrid", "actual_movies") \
+    .rdd.map(lambda row: (row[0], row[1]))
+
+# Compute Spark RankingMetrics
+metrics_als = RankingMetrics(eval_rdd_als)
+metrics_hybrid = RankingMetrics(eval_rdd_hybrid)
+
+print(f"Collaborative Filtering (ALS) MAP: {metrics_als.meanAveragePrecision:.4f}")
+print(f"Collaborative Filtering (ALS) NDCG@20: {metrics_als.ndcgAt(20):.4f}")
+print("---")
+print(f"Hybrid Recommender MAP: {metrics_hybrid.meanAveragePrecision:.4f}")
+print(f"Hybrid Recommender NDCG@20: {metrics_hybrid.ndcgAt(20):.4f}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 10: Export Datasets back to UC Volume
+
+# COMMAND ----------
+
+volume_output_dir = "/Volumes/adb_core_data_dev_aue/default/recommender_volume/exports"
+
+# Save outputs directly to Volume
+final_recommendations.coalesce(1).write.csv(f"{volume_output_dir}/recommendations", header=True, mode="overwrite")
+movie_similarity_matrix.coalesce(1).write.csv(f"{volume_output_dir}/similarities", header=True, mode="overwrite")
+movies_enriched.coalesce(1).write.csv(f"{volume_output_dir}/movies_metadata", header=True, mode="overwrite")
+ratings_df.coalesce(1).write.csv(f"{volume_output_dir}/ratings_history", header=True, mode="overwrite")
+
+print(f"Export completed. Recommendations are stored in your Volume folder: {volume_output_dir}")

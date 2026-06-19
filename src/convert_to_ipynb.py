@@ -1,9 +1,9 @@
 import json
 import os
 
-def py_to_ipynb():
-    py_path = os.path.join("notebooks", "databricks_recommender_pipeline_source.py")
-    ipynb_path = os.path.join("notebooks", "databricks_recommender_pipeline.ipynb")
+def convert_file(py_filename, ipynb_filename):
+    py_path = os.path.join("notebooks", py_filename)
+    ipynb_path = os.path.join("notebooks", ipynb_filename)
     
     if not os.path.exists(py_path):
         print(f"Error: Source file {py_path} not found.")
@@ -32,17 +32,13 @@ def py_to_ipynb():
         for line in lines:
             if line.startswith("# MAGIC %md") or line.startswith("# MAGIC"):
                 is_markdown = True
-                # Extract markdown text: strip leading comment and MAGIC annotations
                 clean_line = line.replace("# MAGIC %md", "").replace("# MAGIC", "").strip()
                 markdown_lines.append(clean_line)
             else:
                 code_lines.append(line)
         
         if is_markdown:
-            # Reconstruct markdown block
-            # If line is empty, represent it, else keep it
             source_lines = [line + "\n" for line in markdown_lines]
-            # Strip trailing newline from the last line to look clean in JSON
             if source_lines:
                 source_lines[-1] = source_lines[-1].rstrip("\n")
                 
@@ -52,8 +48,6 @@ def py_to_ipynb():
                 "source": source_lines
             })
         else:
-            # Code cell
-            # Remove leading databricks tags if any
             source_lines = [line + "\n" for line in code_lines]
             if source_lines:
                 source_lines[-1] = source_lines[-1].rstrip("\n")
@@ -82,7 +76,13 @@ def py_to_ipynb():
     with open(ipynb_path, "w", encoding="utf-8") as f:
         json.dump(notebook, f, indent=1)
         
-    print("Conversion successful!")
+    print(f"Successfully converted {py_filename} -> {ipynb_filename}")
+
+def py_to_ipynb():
+    # Convert standard version
+    convert_file("databricks_recommender_pipeline_source.py", "databricks_recommender_pipeline.ipynb")
+    # Convert Unity Catalog Volume version
+    convert_file("databricks_recommender_pipeline_volume_source.py", "databricks_recommender_pipeline_volume.ipynb")
 
 if __name__ == "__main__":
     py_to_ipynb()
