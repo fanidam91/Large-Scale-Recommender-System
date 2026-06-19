@@ -55,8 +55,9 @@ dbfs_dir = "/tmp/recommender_data"
 dbutils.fs.mkdirs(dbfs_dir)
 
 import uuid
+import shutil
 unique_id = str(uuid.uuid4())[:8]
-local_dir = f"/tmp/helixrec_temp_{unique_id}"
+local_dir = os.path.join(os.getcwd(), f"temp_download_{unique_id}")
 os.makedirs(local_dir, exist_ok=True)
 
 local_zip = os.path.join(local_dir, "ml-latest-small.zip")
@@ -82,6 +83,13 @@ for file_name in os.listdir(src_folder):
     dbfs_file_path = f"dbfs:{dbfs_dir}/{file_name}"
     dbutils.fs.mv(local_file_path, dbfs_file_path)
     print(f"Moved {file_name} to DBFS.")
+
+# Clean up local temporary files inside Workspace
+try:
+    shutil.rmtree(local_dir)
+    print("Cleaned up temporary workspace files.")
+except Exception as e:
+    print(f"Cleanup warning: {e}")
 
 # COMMAND ----------
 
