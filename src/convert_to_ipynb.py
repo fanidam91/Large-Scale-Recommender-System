@@ -2,7 +2,7 @@ import json
 import os
 
 def py_to_ipynb():
-    py_path = os.path.join("notebooks", "databricks_recommender_pipeline.py")
+    py_path = os.path.join("notebooks", "databricks_recommender_pipeline_source.py")
     ipynb_path = os.path.join("notebooks", "databricks_recommender_pipeline.ipynb")
     
     if not os.path.exists(py_path):

@@ -69,11 +69,10 @@ extracted_folder_name = os.listdir(extract_path)[0]  # ml-latest-small
 src_folder = os.path.join(extract_path, extracted_folder_name)
 
 for file_name in os.listdir(src_folder):
-    local_file_path = os.path.join(src_folder, file_name)
-    dbfs_file_path = f"/dbfs{dbfs_dir}/{file_name}"
-    import shutil
-    shutil.move(local_file_path, dbfs_file_path)
-    print(f"Copied {file_name} to DBFS.")
+    local_file_path = f"file:{os.path.join(src_folder, file_name)}"
+    dbfs_file_path = f"dbfs:{dbfs_dir}/{file_name}"
+    dbutils.fs.mv(local_file_path, dbfs_file_path)
+    print(f"Moved {file_name} to DBFS.")
 
 # COMMAND ----------
 
