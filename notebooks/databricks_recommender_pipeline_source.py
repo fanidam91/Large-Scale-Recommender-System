@@ -47,6 +47,10 @@ spark = SparkSession.builder \
 # COMMAND ----------
 
 # Setup directories in DBFS
+import urllib.request
+import zipfile
+import os
+
 dbfs_dir = "/tmp/recommender_data"
 dbutils.fs.mkdirs(dbfs_dir)
 
